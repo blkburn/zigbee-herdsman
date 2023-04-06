@@ -56,6 +56,9 @@ class Znp extends events.EventEmitter {
     private path: string;
     private baudRate: number;
     private rtscts: boolean;
+    private socketRetry: boolean;
+    private socketRetryCountMax: number;
+    private socketRetryCount: number;
 
     private portType: 'serial' | 'socket';
     private serialPort: SerialPort;
@@ -76,11 +79,16 @@ class Znp extends events.EventEmitter {
 
         this.initialized = false;
 
+        this.socketRetry = false;
+        this.socketRetryCount = 0;
+        this.socketRetryCountMax = 5;
+
         this.queue = new Queue();
         this.waitress = new Waitress<ZpiObject, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
 
         this.onUnpiParsed = this.onUnpiParsed.bind(this);
         this.onPortClose = this.onPortClose.bind(this);
+        this.onPortEnd = this.onPortEnd.bind(this);
     }
 
     private log(type: Type, message: string): void {
@@ -115,10 +123,24 @@ class Znp extends events.EventEmitter {
         return this.initialized;
     }
 
+    private async onPortEnd(): Promise<void> {
+        this.socketRetry = true;
+        if (this.socketRetryCount < this.socketRetryCountMax) {
+            this.socketRetryCount += 1;
+            debug.log(`Port closed: retrying ${this.socketRetryCount}`);
+            await Wait(1000);
+            await this.openSocketPort()        
+        } else {
+            this.socketRetry = false;
+        }
+    }
+
     private onPortClose(): void {
-        debug.log('Port closed');
-        this.initialized = false;
-        this.emit('close');
+        if (this.socketRetry === false) {
+            debug.log('Port closed');
+            this.initialized = false;
+            this.emit('close');            
+        }
     }
 
     public async open(): Promise<void> {
@@ -178,12 +200,15 @@ class Znp extends events.EventEmitter {
         this.unpiParser.on('parsed', this.onUnpiParsed);
 
         return new Promise((resolve, reject): void => {
-            this.socketPort.on('connect', function() {
-                debug.log('Socket connected');
-            });
-
             // eslint-disable-next-line
             const self = this;
+
+            this.socketPort.on('connect', function() {
+                debug.log('Socket connected');
+                self.socketRetry = false;
+                self.socketRetryCount = 0;
+            });
+
             this.socketPort.on('ready', async function() {
                 debug.log('Socket ready');
                 await self.skipBootloader();
@@ -193,10 +218,16 @@ class Znp extends events.EventEmitter {
 
             this.socketPort.once('close', this.onPortClose);
 
+            this.socketPort.once('end', this.onPortEnd);
+
             this.socketPort.on('error', function () {
-                debug.log('Socket error');
-                reject(new Error(`Error while opening socket`));
-                self.initialized = false;
+                if (self.socketRetry === false) {
+                    debug.log('Socket error');
+                    reject(new Error(`Error while opening socket`));
+                    self.initialized = false;                    
+                } else {
+                    self.onPortEnd()                
+                }
             });
 
             this.socketPort.connect(info.port, info.host);
@@ -277,6 +308,7 @@ class Znp extends events.EventEmitter {
                         });
                     });
                 } else {
+                    this.socketRetry = false;
                     this.socketPort.destroy();
                     resolve();
                 }
